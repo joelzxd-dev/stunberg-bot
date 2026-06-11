@@ -24,6 +24,8 @@ class BaseBot(commands.Bot):
         try:
             self.db_pool = await asyncpg.create_pool(
                 self.config.DATABASE_URL,
+                min_size=1,
+                max_size=5,
                 command_timeout=60.0,
                 max_inactive_connection_lifetime=300.0,
                 statement_cache_size=0,
@@ -40,6 +42,8 @@ class BaseBot(commands.Bot):
         try:
             self.db_pool = await asyncpg.create_pool(
                 self.config.DATABASE_URL,
+                min_size=1,
+                max_size=5,
                 command_timeout=60.0,
                 max_inactive_connection_lifetime=300.0,
                 statement_cache_size=0,

@@ -1,0 +1,14 @@
+[Unit]
+Description=Stunberg Bot - Cerita
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/stunberg-bot
+ExecStart=/home/ubuntu/stunberg-bot/venv/bin/python run_cerita.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

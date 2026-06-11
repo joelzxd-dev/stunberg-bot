@@ -50,7 +50,7 @@ class TasksCog(commands.Cog):
 
             if qty > 0:
                 embed = discord.Embed(
-                    title="📕 AUTO-CLOSING HARIAN", color=discord.Color.dark_red()
+                    title="📕 LAPORAN HARI INI", color=discord.Color.dark_red()
                 )
                 embed.add_field(name="Tanggal",         value=now.strftime("%d/%m/%Y"))
                 embed.add_field(name="Total Transaksi", value=f"{qty} items")

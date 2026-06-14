@@ -149,9 +149,71 @@ class WDApprovalView(discord.ui.View):
 
 
 # ==============================================================================
-# BASE COG: shared add/dashboard logic
+# MODAL: Input jumlah WD — diisi dinamis dari tabel warehouse
 # ==============================================================================
-class BaseWarehouseCog(commands.Cog):
+class WDModal(discord.ui.Modal, title="Ajukan Penjualan (WD)"):
+    def __init__(self, bot, items_harga: list, requester: discord.Member):
+        super().__init__()
+        self.bot_ref     = bot
+        self.items_harga = items_harga  # [(nama, harga), ...]
+        self.requester   = requester
+        config           = bot.config
+
+        for nama, harga in items_harga[:5]:  # Discord modal maks 5 input
+            placeholder = (
+                f"Jumlah pcs (@ {config.CURRENCY} {harga:,}/pcs)" if harga > 0
+                else "Masukkan jumlah pcs"
+            )
+            self.add_item(discord.ui.TextInput(
+                label=nama,
+                placeholder=placeholder,
+                required=False,
+                max_length=6,
+            ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.requester.id in self.bot_ref.pending_wd_users:
+            return await interaction.response.send_message(
+                "⛔ Anda masih punya WD Pending.", ephemeral=True
+            )
+
+        data = []
+        for i, (nama, harga) in enumerate(self.items_harga[:5]):
+            val = self.children[i].value.strip()
+            try:
+                qty = int(val) if val else 0
+            except ValueError:
+                qty = 0
+            if qty > 0:
+                data.append((nama, qty, harga))
+
+        if not data:
+            return await interaction.response.send_message(
+                "❌ Isi setidaknya satu barang.", ephemeral=True
+            )
+
+        self.bot_ref.pending_wd_users.add(self.requester.id)
+        config = self.bot_ref.config
+        cur    = config.CURRENCY
+        total  = sum(q * h for _, q, h in data)
+        desc   = "".join(f"• **{n}**: {q} pcs ({cur} {q*h:,})\n" for n, q, h in data)
+
+        embed = discord.Embed(title="⏳ PENDING APPROVAL", color=discord.Color.orange())
+        embed.add_field(name="Status",           value="Menunggu Manager...",    inline=False)
+        embed.add_field(name="Pengaju",          value=self.requester.mention,   inline=True)
+        embed.add_field(name="Total Uang Fisik", value=f"**{cur} {total:,}**",  inline=True)
+        embed.add_field(name="Rincian Barang",   value=desc,                     inline=False)
+        embed.set_footer(text="Manager: Cek fisik sebelum ACC.")
+
+        view = WDApprovalView(self.bot_ref, data, self.requester, total)
+        await interaction.response.send_message(embed=embed, view=view)
+        view.message = await interaction.original_response()
+
+
+# ==============================================================================
+# COG: Dynamic Warehouse — barang diambil dari DB, tidak perlu hardcode
+# ==============================================================================
+class WarehouseCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
@@ -164,20 +226,50 @@ class BaseWarehouseCog(commands.Cog):
             return False
         return True
 
-    def _build_wd_embed(self, interaction, data, total):
+    # ---- autocomplete: ambil nama_barang dari tabel warehouse ----
+    async def _item_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if not self.bot.db_pool:
+            return []
         config = self.bot.config
-        cur    = config.CURRENCY
-        desc   = "".join([f"• **{n}**: {q} pcs ({cur} {q*h:,})\n" for n, q, h in data if q > 0])
+        async with self.bot.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT nama_barang FROM {config.TABLE_WAREHOUSE} ORDER BY nama_barang"
+            )
+        return [
+            app_commands.Choice(name=r['nama_barang'], value=r['nama_barang'])
+            for r in rows if current.lower() in r['nama_barang'].lower()
+        ][:25]
 
-        embed = discord.Embed(title="⏳ PENDING APPROVAL", color=discord.Color.orange())
-        embed.add_field(name="Status",           value="Menunggu Manager...",     inline=False)
-        embed.add_field(name="Pengaju",          value=interaction.user.mention,  inline=True)
-        embed.add_field(name="Total Uang Fisik", value=f"**{cur} {total:,}**",    inline=True)
-        embed.add_field(name="Rincian Barang",   value=desc,                      inline=False)
-        embed.set_footer(text="Manager: Cek fisik sebelum ACC.")
-        return embed
+    @app_commands.command(name="wd", description="Ajukan Penjualan")
+    async def wd(self, interaction: discord.Interaction):
+        if interaction.user.id in self.bot.pending_wd_users:
+            return await interaction.response.send_message(
+                "⛔ Anda masih punya WD Pending.", ephemeral=True
+            )
 
-    async def _add_item(self, interaction: discord.Interaction, nama_barang: str, jumlah: int):
+        config = self.bot.config
+        async with self.bot.db_pool.acquire() as conn:
+            harga_db = await get_warehouse_prices(conn, config)
+
+        def harga(nama: str) -> int:
+            h = harga_db.get(nama, 0)
+            return h if h > 0 else config.HARGA_MODAL.get(nama, 0)
+
+        items_harga = [(nama, harga(nama)) for nama in sorted(harga_db.keys())]
+
+        if not items_harga:
+            return await interaction.response.send_message(
+                "❌ Tidak ada barang di gudang.", ephemeral=True
+            )
+
+        modal = WDModal(self.bot, items_harga, interaction.user)
+        await interaction.response.send_modal(modal)
+
+    @app_commands.command(name="add", description="Masukan barang fisik ke Gudang (Admin Only)")
+    @app_commands.autocomplete(item=_item_autocomplete)
+    async def add(self, interaction: discord.Interaction, item: str, jumlah: int):
         if not is_admin(interaction):
             return await interaction.response.send_message(
                 "⛔ Khusus Manager/Admin.", ephemeral=True
@@ -194,17 +286,17 @@ class BaseWarehouseCog(commands.Cog):
         try:
             async with self.bot.db_pool.acquire() as conn:
                 async with conn.transaction():
-                    stok_baru = await update_stock(self.bot, conn, config, nama_barang, jumlah)
+                    stok_baru = await update_stock(self.bot, conn, config, item, jumlah)
                     await conn.execute(f"""
                         INSERT INTO {config.TABLE_INCOMING_LOG}
                             (nama_barang, jumlah, penanggung_jawab)
                         VALUES ($1, $2, $3)
-                    """, nama_barang, jumlah, admin_name)
+                    """, item, jumlah, admin_name)
 
             await refresh_dashboard(self.bot)
 
             embed = discord.Embed(title="📦 STOK DITAMBAHKAN", color=discord.Color.blue())
-            embed.add_field(name="Barang",          value=nama_barang,        inline=True)
+            embed.add_field(name="Barang",          value=item,               inline=True)
             embed.add_field(name="Jumlah",          value=f"+{jumlah} pcs",   inline=True)
             embed.add_field(name="Total di Gudang", value=f"{stok_baru} pcs", inline=False)
             embed.set_footer(text=f"Diinput oleh: {admin_name}")
@@ -214,124 +306,5 @@ class BaseWarehouseCog(commands.Cog):
             await interaction.followup.send(f"❌ Error Database: {e}")
 
 
-# ==============================================================================
-# COG: Satumimpi — Repair Kit, Cleaning Kit, Tire Kit, Nitrous
-# ==============================================================================
-class SatumimpiWarehouseCog(BaseWarehouseCog):
-    @app_commands.command(name="wd", description="Ajukan Penjualan")
-    async def wd(
-        self,
-        interaction: discord.Interaction,
-        repair_kit:   int = 0,
-        cleaning_kit: int = 0,
-        tire_kit:     int = 0,
-        nitrous:      int = 0,
-    ):
-        if interaction.user.id in self.bot.pending_wd_users:
-            return await interaction.response.send_message(
-                "⛔ Anda masih punya WD Pending.", ephemeral=True
-            )
-        if repair_kit + cleaning_kit + tire_kit + nitrous <= 0:
-            return await interaction.response.send_message("❌ Isi barang dulu.", ephemeral=True)
-
-        self.bot.pending_wd_users.add(interaction.user.id)
-        config = self.bot.config
-
-        async with self.bot.db_pool.acquire() as conn:
-            harga_db = await get_warehouse_prices(conn, config)
-
-        def harga(nama: str) -> int:
-            h = harga_db.get(nama, 0)
-            return h if h > 0 else config.HARGA_MODAL.get(nama, 0)
-
-        data  = [
-            ("Repair Kit",   repair_kit,   harga("Repair Kit")),
-            ("Cleaning Kit", cleaning_kit, harga("Cleaning Kit")),
-            ("Tire Kit",     tire_kit,     harga("Tire Kit")),
-            ("Nitrous",      nitrous,      harga("Nitrous")),
-        ]
-        total = sum(q * h for _, q, h in data)
-        embed = self._build_wd_embed(interaction, data, total)
-        view  = WDApprovalView(self.bot, data, interaction.user, total)
-        await interaction.response.send_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
-
-    @app_commands.command(name="add", description="Masukan barang fisik ke Gudang (Admin Only)")
-    @app_commands.choices(item=[
-        app_commands.Choice(name="Repair Kit",   value="Repair Kit"),
-        app_commands.Choice(name="Cleaning Kit", value="Cleaning Kit"),
-        app_commands.Choice(name="Tire Kit",     value="Tire Kit"),
-        app_commands.Choice(name="Nitrous",      value="Nitrous"),
-    ])
-    async def add(
-        self,
-        interaction: discord.Interaction,
-        item:   app_commands.Choice[str],
-        jumlah: int,
-    ):
-        await self._add_item(interaction, item.value, jumlah)
-
-
-# ==============================================================================
-# COG: Cerita — ADV Repair Kit, Repair Kit, Cleaning Kit, Stancer Kit
-# ==============================================================================
-class CeritaWarehouseCog(BaseWarehouseCog):
-    @app_commands.command(name="wd", description="Ajukan Penjualan")
-    async def wd(
-        self,
-        interaction: discord.Interaction,
-        adv_repair_kit: int = 0,
-        repair_kit:     int = 0,
-        cleaning_kit:   int = 0,
-        stancer_kit:    int = 0,
-    ):
-        if interaction.user.id in self.bot.pending_wd_users:
-            return await interaction.response.send_message(
-                "⛔ Anda masih punya WD Pending.", ephemeral=True
-            )
-        if adv_repair_kit + repair_kit + cleaning_kit + stancer_kit <= 0:
-            return await interaction.response.send_message("❌ Isi barang dulu.", ephemeral=True)
-
-        self.bot.pending_wd_users.add(interaction.user.id)
-        config = self.bot.config
-
-        async with self.bot.db_pool.acquire() as conn:
-            harga_db = await get_warehouse_prices(conn, config)
-
-        def harga(nama: str) -> int:
-            h = harga_db.get(nama, 0)
-            return h if h > 0 else config.HARGA_MODAL.get(nama, 0)
-
-        data  = [
-            ("ADV Repair Kit", adv_repair_kit, harga("ADV Repair Kit")),
-            ("Repair Kit",     repair_kit,     harga("Repair Kit")),
-            ("Cleaning Kit",   cleaning_kit,   harga("Cleaning Kit")),
-            ("Stancer Kit",    stancer_kit,    harga("Stancer Kit")),
-        ]
-        total = sum(q * h for _, q, h in data)
-        embed = self._build_wd_embed(interaction, data, total)
-        view  = WDApprovalView(self.bot, data, interaction.user, total)
-        await interaction.response.send_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
-
-    @app_commands.command(name="add", description="Masukan barang fisik ke Gudang (Admin Only)")
-    @app_commands.choices(item=[
-        app_commands.Choice(name="ADV Repair Kit", value="ADV Repair Kit"),
-        app_commands.Choice(name="Repair Kit",     value="Repair Kit"),
-        app_commands.Choice(name="Cleaning Kit",   value="Cleaning Kit"),
-        app_commands.Choice(name="Stancer Kit",    value="Stancer Kit"),
-    ])
-    async def add(
-        self,
-        interaction: discord.Interaction,
-        item:   app_commands.Choice[str],
-        jumlah: int,
-    ):
-        await self._add_item(interaction, item.value, jumlah)
-
-
 async def setup(bot):
-    if bot.config.BOT_ID == "satumimpi":
-        await bot.add_cog(SatumimpiWarehouseCog(bot))
-    else:
-        await bot.add_cog(CeritaWarehouseCog(bot))
+    await bot.add_cog(WarehouseCog(bot))

@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -5,7 +6,7 @@ from datetime import datetime
 
 from utils.helpers import is_admin
 from utils.database import (
-    get_warehouse_prices, get_last_balance,
+    get_last_balance,
     update_stock, refresh_dashboard, refresh_finance,
 )
 
@@ -226,20 +227,14 @@ class WarehouseCog(commands.Cog):
             return False
         return True
 
-    # ---- autocomplete: ambil nama_barang dari tabel warehouse ----
+    # ---- autocomplete: ambil nama_barang dari cache (bukan query DB tiap keystroke) ----
     async def _item_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        if not self.bot.db_pool:
-            return []
-        config = self.bot.config
-        async with self.bot.db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"SELECT nama_barang FROM {config.TABLE_WAREHOUSE} ORDER BY nama_barang"
-            )
+        names = sorted(self.bot.warehouse_cache.keys())
         return [
-            app_commands.Choice(name=r['nama_barang'], value=r['nama_barang'])
-            for r in rows if current.lower() in r['nama_barang'].lower()
+            app_commands.Choice(name=n, value=n)
+            for n in names if current.lower() in n.lower()
         ][:25]
 
     @app_commands.command(name="wd", description="Ajukan Penjualan")
@@ -249,9 +244,17 @@ class WarehouseCog(commands.Cog):
                 "⛔ Anda masih punya WD Pending.", ephemeral=True
             )
 
-        config = self.bot.config
-        async with self.bot.db_pool.acquire() as conn:
-            harga_db = await get_warehouse_prices(conn, config)
+        config   = self.bot.config
+        harga_db = self.bot.warehouse_cache
+        if not harga_db:
+            # Cache belum pernah terisi (mis. gagal saat startup) — coba refresh
+            # sekali dengan budget waktu ketat supaya tidak melewati batas 3 detik
+            # Discord untuk menampilkan modal.
+            try:
+                await asyncio.wait_for(self.bot.refresh_warehouse_cache(), timeout=2.0)
+            except Exception:
+                pass
+            harga_db = self.bot.warehouse_cache
 
         def harga(nama: str) -> int:
             h = harga_db.get(nama, 0)
@@ -261,7 +264,8 @@ class WarehouseCog(commands.Cog):
 
         if not items_harga:
             return await interaction.response.send_message(
-                "❌ Tidak ada barang di gudang.", ephemeral=True
+                "❌ Data gudang belum siap / tidak ada barang. Coba lagi sesaat lagi.",
+                ephemeral=True
             )
 
         modal = WDModal(self.bot, items_harga, interaction.user)
@@ -294,6 +298,7 @@ class WarehouseCog(commands.Cog):
                     """, item, jumlah, admin_name)
 
             await refresh_dashboard(self.bot)
+            await self.bot.refresh_warehouse_cache()  # pick up barang baru untuk /wd & autocomplete
 
             embed = discord.Embed(title="📦 STOK DITAMBAHKAN", color=discord.Color.blue())
             embed.add_field(name="Barang",          value=item,               inline=True)

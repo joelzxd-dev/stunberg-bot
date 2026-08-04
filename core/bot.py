@@ -17,6 +17,21 @@ class BaseBot(commands.Bot):
         self.config = config
         self.db_pool: asyncpg.Pool | None = None
         self.pending_wd_users: set[int]   = set()
+        self.warehouse_cache: dict[str, int] = {}  # {nama_barang: harga_satuan}, refreshed on startup/add
+
+    async def refresh_warehouse_cache(self) -> bool:
+        """Reload nama_barang + harga dari DB ke memori supaya /wd tidak perlu query DB
+        sebelum merespons (modal harus dijawab <3 detik, tidak bisa di-defer)."""
+        from utils.database import get_warehouse_prices
+        if not await self.ensure_db():
+            return False
+        try:
+            async with self.db_pool.acquire() as conn:
+                self.warehouse_cache = await get_warehouse_prices(conn, self.config)
+            return True
+        except Exception as e:
+            print(f"⚠️  Gagal refresh warehouse cache: {e}")
+            return False
 
     async def ensure_db(self) -> bool:
         if self.db_pool and not self.db_pool._closed:
@@ -54,6 +69,8 @@ class BaseBot(commands.Bot):
                 print("✅ Harga warehouse diinisialisasi.")
                 await init_role_salaries(conn, self.config)
                 print("✅ Data roles diinisialisasi.")
+            await self.refresh_warehouse_cache()
+            print("✅ Warehouse cache dimuat.")
         except Exception as e:
             print(f"⚠️  Koneksi DB gagal saat startup: {e}")
             print("    Bot tetap jalan — DB akan dicoba reconnect saat command digunakan.")
